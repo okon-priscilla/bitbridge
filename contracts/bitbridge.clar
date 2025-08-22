@@ -195,3 +195,187 @@
         (total-fees (+ platform-fee business-fee))
         (net-amount (- payment-amount total-fees))
       )
+      (try! (contract-call? 'ST1F7QA2MDF17S807EPA36TSS8AMEFY4KA9TVGWXT.sbtc-token
+        transfer payment-amount caller (as-contract tx-sender) none
+      ))
+
+      (let ((current-balance (default-to u0 (map-get? business-balances (get business payment)))))
+        (map-set business-balances (get business payment)
+          (+ current-balance net-amount)
+        )
+      )
+
+      (if (> platform-fee u0)
+        (try! (as-contract (contract-call? 'ST1F7QA2MDF17S807EPA36TSS8AMEFY4KA9TVGWXT.sbtc-token
+          transfer platform-fee tx-sender (var-get fee-collector) none
+        )))
+        true
+      )
+
+      (map-set payments payment-id
+        (merge payment {
+          customer: (some caller),
+          status: "completed",
+          processed-at: (some current-block),
+          processor: (some caller),
+        })
+      )
+
+      (map-set businesses (get business payment)
+        (merge business-data { total-processed: (+ (get total-processed business-data) payment-amount) })
+      )
+
+      (ok {
+        payment-id: payment-id,
+        net-amount: net-amount,
+        fees: total-fees,
+      })
+    )
+  )
+)
+
+;; Merchant withdraws their available balance
+(define-public (withdraw-balance (amount uint))
+  (let (
+      (caller tx-sender)
+      (current-balance (default-to u0 (map-get? business-balances caller)))
+    )
+    (asserts! (is-some (map-get? businesses caller)) ERR_BUSINESS_NOT_REGISTERED)
+    (asserts! (>= current-balance amount) ERR_INSUFFICIENT_BALANCE)
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+
+    (map-set business-balances caller (- current-balance amount))
+
+    (try! (as-contract (contract-call? 'ST1F7QA2MDF17S807EPA36TSS8AMEFY4KA9TVGWXT.sbtc-token
+      transfer amount tx-sender caller none
+    )))
+
+    (ok amount)
+  )
+)
+
+;; Allows a business to refund a previously completed payment.
+(define-public (refund-payment (payment-id uint))
+  (let (
+      (caller tx-sender)
+      (payment (unwrap! (map-get? payments payment-id) ERR_PAYMENT_NOT_FOUND))
+      (customer (unwrap! (get customer payment) ERR_PAYMENT_NOT_FOUND))
+    )
+    (asserts! (is-eq caller (get business payment)) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status payment) "completed")
+      ERR_PAYMENT_ALREADY_PROCESSED
+    )
+
+    (let (
+        (refund-amount (get amount payment))
+        (current-balance (default-to u0 (map-get? business-balances caller)))
+      )
+      (asserts! (>= current-balance refund-amount) ERR_INSUFFICIENT_BALANCE)
+
+      (map-set business-balances caller (- current-balance refund-amount))
+
+      (try! (as-contract (contract-call? 'ST1F7QA2MDF17S807EPA36TSS8AMEFY4KA9TVGWXT.sbtc-token
+        transfer refund-amount tx-sender customer none
+      )))
+
+      (map-set payments payment-id
+        (merge payment {
+          status: "refunded",
+          processed-at: (some stacks-block-height),
+        })
+      )
+
+      (ok refund-amount)
+    )
+  )
+)
+
+;; Admin-only: updates global platform fee
+(define-public (set-platform-fee (new-fee-basis-points uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (<= new-fee-basis-points u1000) ERR_INVALID_AMOUNT)
+    (var-set platform-fee-basis-points new-fee-basis-points)
+    (ok true)
+  )
+)
+
+;; Admin-only: updates address that receives platform fees
+(define-public (set-fee-collector (new-collector principal))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (not (is-eq new-collector 'SP000000000000000000002Q6VF78))
+      ERR_INVALID_AMOUNT
+    )
+    (var-set fee-collector new-collector)
+    (ok true)
+  )
+)
+
+;; Read-only Functions
+
+(define-read-only (get-payment (payment-id uint))
+  (map-get? payments payment-id)
+)
+
+(define-read-only (get-payment-by-reference
+    (business principal)
+    (reference (string-ascii 64))
+  )
+  (let ((payment-id (map-get? payment-references {
+      business: business,
+      reference: reference,
+    })))
+    (match payment-id
+      id (map-get? payments id)
+      none
+    )
+  )
+)
+
+(define-read-only (get-business (business-principal principal))
+  (map-get? businesses business-principal)
+)
+
+(define-read-only (get-business-balance (business-principal principal))
+  (default-to u0 (map-get? business-balances business-principal))
+)
+
+(define-read-only (get-platform-fee)
+  (var-get platform-fee-basis-points)
+)
+
+(define-read-only (get-fee-collector)
+  (var-get fee-collector)
+)
+
+(define-read-only (calculate-fees
+    (amount uint)
+    (business-fee-rate uint)
+  )
+  (let (
+      (platform-fee (/ (* amount (var-get platform-fee-basis-points)) u10000))
+      (business-fee (/ (* amount business-fee-rate) u10000))
+    )
+    {
+      platform-fee: platform-fee,
+      business-fee: business-fee,
+      total-fees: (+ platform-fee business-fee),
+      net-amount: (- amount (+ platform-fee business-fee)),
+    }
+  )
+)
+
+(define-read-only (is-payment-valid (payment-id uint))
+  (match (map-get? payments payment-id)
+    payment (and
+      (is-eq (get status payment) "pending")
+      (< stacks-block-height (get expires-at payment))
+    )
+    false
+  )
+)
+
+(define-read-only (get-next-payment-id)
+  (var-get next-payment-id)
+)
