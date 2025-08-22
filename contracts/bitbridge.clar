@@ -92,3 +92,106 @@
     (ok true)
   )
 )
+
+;; Updates an existing business profile, including fee settings and webhook URL.
+(define-public (update-business
+    (name (string-ascii 64))
+    (webhook-url (optional (string-ascii 256)))
+    (fee-rate uint)
+  )
+  (let (
+      (caller tx-sender)
+      (current-business (unwrap! (map-get? businesses caller) ERR_BUSINESS_NOT_REGISTERED))
+    )
+    (asserts! (< fee-rate u1000) ERR_INVALID_AMOUNT)
+    (asserts! (> (len name) u0) ERR_INVALID_AMOUNT)
+    (asserts! (<= (len name) u64) ERR_INVALID_AMOUNT)
+    (map-set businesses caller
+      (merge current-business {
+        name: name,
+        webhook-url: webhook-url,
+        fee-rate: fee-rate,
+      })
+    )
+    (ok true)
+  )
+)
+
+;; Initiates a payment request (invoice) with expiration and unique reference ID.
+(define-public (create-payment
+    (amount uint)
+    (description (string-ascii 256))
+    (reference-id (string-ascii 64))
+    (expires-in-blocks uint)
+  )
+  (let (
+      (caller tx-sender)
+      (payment-id (var-get next-payment-id))
+      (current-block stacks-block-height)
+      (expiry-block (+ current-block expires-in-blocks))
+    )
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (> expires-in-blocks u0) ERR_INVALID_AMOUNT)
+    (asserts! (< expires-in-blocks u4320) ERR_INVALID_AMOUNT)
+    ;; ~30 days
+    (asserts! (> (len description) u0) ERR_INVALID_AMOUNT)
+    (asserts! (<= (len description) u256) ERR_INVALID_AMOUNT)
+    (asserts! (> (len reference-id) u0) ERR_INVALID_AMOUNT)
+    (asserts! (<= (len reference-id) u64) ERR_INVALID_AMOUNT)
+    (asserts! (is-some (map-get? businesses caller)) ERR_BUSINESS_NOT_REGISTERED)
+    (asserts!
+      (is-none (map-get? payment-references {
+        business: caller,
+        reference: reference-id,
+      }))
+      ERR_PAYMENT_ALREADY_PROCESSED
+    )
+
+    (map-set payments payment-id {
+      business: caller,
+      customer: none,
+      amount: amount,
+      description: description,
+      reference-id: reference-id,
+      status: "pending",
+      created-at: current-block,
+      expires-at: expiry-block,
+      processed-at: none,
+      processor: none,
+    })
+
+    (map-set payment-references {
+      business: caller,
+      reference: reference-id,
+    }
+      payment-id
+    )
+
+    (var-set next-payment-id (+ payment-id u1))
+    (ok payment-id)
+  )
+)
+
+;; Customer pays a pending invoice; platform & merchant fees are handled.
+(define-public (pay-invoice (payment-id uint))
+  (let (
+      (caller tx-sender)
+      (payment (unwrap! (map-get? payments payment-id) ERR_PAYMENT_NOT_FOUND))
+      (business-data (unwrap! (map-get? businesses (get business payment))
+        ERR_BUSINESS_NOT_REGISTERED
+      ))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-eq (get status payment) "pending")
+      ERR_PAYMENT_ALREADY_PROCESSED
+    )
+    (asserts! (< current-block (get expires-at payment)) ERR_PAYMENT_EXPIRED)
+    (asserts! (get is-active business-data) ERR_UNAUTHORIZED)
+
+    (let (
+        (payment-amount (get amount payment))
+        (platform-fee (/ (* payment-amount (var-get platform-fee-basis-points)) u10000))
+        (business-fee (/ (* payment-amount (get fee-rate business-data)) u10000))
+        (total-fees (+ platform-fee business-fee))
+        (net-amount (- payment-amount total-fees))
+      )
